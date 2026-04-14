@@ -1,0 +1,39 @@
+[package]
+name = "polymarket-rust-rl"
+version = "0.1.0"
+edition = "2021"
+description = "HFT-inspired per-core execution architecture for Polymarket RL"
+
+[dependencies]
+rust_decimal = { version = "1", features = ["serde-with-str", "macros"] }
+num-traits = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "gate_bench"
+harness = false
+
+[[bench]]
+name = "seqlock_bench"
+harness = false
+
+[[bench]]
+name = "spsc_bench"
+harness = false
+
+[[bench]]
+name = "tick_cycle_bench"
+harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+lto = true
+codegen-units = 1
