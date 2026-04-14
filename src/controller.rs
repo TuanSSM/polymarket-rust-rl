@@ -1,326 +1,253 @@
-use crate::seqlock::SeqLock;
-use crate::spsc::{Producer, SpscRingBuffer};
-use crate::types::{Parameters, Signal, TradeEvent};
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::{broadcast, watch};
 
-/// Multi-core orchestrator. Publishes parameters via SeqLock,
-/// distributes trade events to per-core SPSC channels, and
-/// drains signals from core engines.
-pub struct Controller<'a> {
-    producers: Vec<Producer<'a, TradeEvent>>,
-    params: Arc<SeqLock<Parameters>>,
-    collected_signals: Vec<Signal>,
-    events_published: u64,
+use crate::bayesian::BayesianEstimator;
+use crate::chainlink::ChainlinkClient;
+use crate::config::Config;
+use crate::engine::CoreEngine;
+use crate::error::BotError;
+use crate::exchange_ws::ExchangeWsClient;
+use crate::policy::{EpisodeOutcome, LinearPolicy, Params};
+use crate::polymarket_rest::{MarketInfo, PolymarketRestClient};
+use crate::polymarket_ws::{MarketSubscription, OrderBookSnapshot, PolymarketWsClient};
+use crate::seg_lock::{self, SegLockReader, SegLockWriter};
+use crate::signal::{Exchange, OracleTick, SignalEngine, SignalSnapshot, TradeEvent};
+use crate::spsc;
+
+pub struct Controller {
+    config: Config,
+    policy: LinearPolicy,
+    params_tx: SegLockWriter<Params>,
+    params_rx: SegLockReader<Params>,
+    rest_client: Arc<PolymarketRestClient>,
 }
 
-impl<'a> Controller<'a> {
-    pub fn new(
-        producers: Vec<Producer<'a, TradeEvent>>,
-        params: Arc<SeqLock<Parameters>>,
-    ) -> Self {
-        Self {
-            producers,
-            params,
-            collected_signals: Vec::with_capacity(256),
-            events_published: 0,
+impl Controller {
+    pub fn new(config: Config) -> Result<Self, BotError> {
+        let policy = LinearPolicy::new(
+            config.strategy.learning_rate,
+            config.strategy.discount,
+            config.strategy.epsilon,
+        );
+
+        let initial_params = policy.export_params(&config.risk);
+        let (params_tx, params_rx) = seg_lock::seg_lock(initial_params);
+
+        let rest_client = Arc::new(
+            PolymarketRestClient::new(&config.polymarket).map_err(BotError::Clob)?,
+        );
+
+        Ok(Self {
+            config,
+            policy,
+            params_tx,
+            params_rx,
+            rest_client,
+        })
+    }
+
+    pub async fn run(mut self) -> Result<(), BotError> {
+        // 1. Discover markets
+        tracing::info!("discovering markets...");
+        let markets = self
+            .rest_client
+            .discover_markets()
+            .await
+            .map_err(BotError::Clob)?;
+        tracing::info!(count = markets.len(), "markets discovered");
+
+        let markets: Vec<MarketInfo> = markets
+            .into_iter()
+            .filter(|m| !m.tokens.is_empty())
+            .take(self.config.execution.max_active_markets)
+            .collect();
+
+        if markets.is_empty() {
+            tracing::warn!("no active markets found, exiting");
+            return Ok(());
         }
-    }
 
-    /// Publish updated parameters to all cores via SeqLock.
-    pub fn publish_parameters(&self, params: Parameters) {
-        self.params.write(params);
-    }
+        // 2. Create signal broadcast channel
+        let (signal_tx, _) = broadcast::channel::<SignalSnapshot>(256);
 
-    /// Read current parameters.
-    pub fn current_parameters(&self) -> Parameters {
-        self.params.read()
-    }
+        // 3. Spawn feed tasks
+        self.spawn_feeds(signal_tx.clone());
 
-    /// Send a trade event to a specific core by index.
-    pub fn send_event(&mut self, core_idx: usize, event: TradeEvent) -> Result<(), TradeEvent> {
-        if core_idx >= self.producers.len() {
-            return Err(event);
+        // 4. Spawn signal engine
+        self.spawn_signal_engine(signal_tx.clone());
+
+        // 5. Spawn CoreEngine per market
+        let mut outcome_consumers = Vec::new();
+        let mut market_subs = Vec::new();
+
+        for market in &markets {
+            let token = match market.tokens.first() {
+                Some(t) => t,
+                None => continue,
+            };
+
+            // Per-market book channel (watch: latest-value semantics)
+            let (book_tx, book_rx) =
+                watch::channel::<Option<OrderBookSnapshot>>(None);
+            market_subs.push(MarketSubscription {
+                token_id: token.token_id.clone(),
+                market_id: market.condition_id.clone(),
+                tx: book_tx,
+            });
+
+            // Per-engine outcome SPSC
+            let (outcome_tx, outcome_rx) = spsc::spsc_channel(16);
+            outcome_consumers.push(outcome_rx);
+
+            let bayesian = BayesianEstimator::new(
+                self.config.strategy.cvd_weight,
+                self.config.strategy.delay_weight,
+                self.config.strategy.premium_weight,
+            );
+
+            let engine_policy = LinearPolicy::new(
+                self.config.strategy.learning_rate,
+                self.config.strategy.discount,
+                self.config.strategy.epsilon,
+            );
+
+            let engine = CoreEngine::new(
+                market.condition_id.clone(),
+                token.token_id.clone(),
+                signal_tx.subscribe(),
+                book_rx,
+                self.params_rx.clone(),
+                outcome_tx,
+                Arc::clone(&self.rest_client),
+                self.config.execution.mode,
+                self.config.execution.episode_secs,
+                0.1, // gate threshold
+                bayesian,
+                engine_policy,
+            );
+
+            tracing::info!(
+                market = %market.condition_id,
+                question = %market.question,
+                "spawning engine"
+            );
+
+            tokio::spawn(engine.run());
         }
-        let result = self.producers[core_idx].try_push(event);
-        if result.is_ok() {
-            self.events_published += 1;
-        }
-        result
-    }
 
-    /// Route a trade event to the appropriate core based on market_id.
-    pub fn route_event(&mut self, event: TradeEvent) -> Result<(), TradeEvent> {
-        if self.producers.is_empty() {
-            return Err(event);
-        }
-        let core_idx = event.market_id as usize % self.producers.len();
-        self.send_event(core_idx, event)
-    }
+        // 6. Spawn Polymarket WS for book feeds
+        let poly_ws = PolymarketWsClient::new(&self.config.polymarket);
+        tokio::spawn(async move {
+            if let Err(e) = poly_ws.run(market_subs).await {
+                tracing::error!(error = %e, "polymarket ws error");
+            }
+        });
 
-    /// Broadcast a trade event to all cores.
-    pub fn broadcast_event(&mut self, event: TradeEvent) -> usize {
-        let mut sent = 0;
-        for producer in &self.producers {
-            if producer.try_push(event).is_ok() {
-                sent += 1;
+        // 7. Main control loop
+        tracing::info!(
+            mode = ?self.config.execution.mode,
+            markets = markets.len(),
+            "controller running"
+        );
+
+        let mut interval = tokio::time::interval(Duration::from_millis(100));
+
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {
+                    // Drain episode outcomes and update RL weights
+                    for rx in &mut outcome_consumers {
+                        while let Some(outcome) = rx.drain_last() {
+                            self.on_episode_outcome(outcome);
+                        }
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("received ctrl-c, shutting down");
+                    break;
+                }
             }
         }
-        self.events_published += sent as u64;
-        sent
+
+        Ok(())
     }
 
-    /// Collect signals from external signal vecs.
-    pub fn collect_signals(&mut self, signals: &mut Vec<Signal>) {
-        self.collected_signals.append(signals);
+    fn on_episode_outcome(&mut self, outcome: EpisodeOutcome) {
+        tracing::info!(
+            market_id = outcome.market_id,
+            pnl = outcome.pnl_usd,
+            fills = outcome.fills,
+            cancels = outcome.cancels,
+            "RL update from episode"
+        );
+
+        // TD(0) terminal update on master policy
+        self.policy.td0_terminal(
+            &outcome.final_state,
+            outcome.last_action,
+            outcome.pnl_usd,
+        );
+
+        // Republish updated weights
+        let new_params = self.policy.export_params(&self.config.risk);
+        self.params_tx.write(new_params);
     }
 
-    /// Drain all collected signals.
-    pub fn drain_collected_signals(&mut self) -> Vec<Signal> {
-        std::mem::take(&mut self.collected_signals)
+    fn spawn_feeds(&self, _signal_tx: broadcast::Sender<SignalSnapshot>) {
+        // Chainlink WS
+        let chainlink_config = self.config.feeds.chainlink.clone();
+        let (cl_tx, _cl_rx) = spsc::spsc_channel::<OracleTick>(256);
+        let cl_client = ChainlinkClient::new(chainlink_config);
+        tokio::spawn(async move {
+            if let Err(e) = cl_client.run(cl_tx).await {
+                tracing::error!(error = %e, "chainlink feed error");
+            }
+        });
+
+        // Binance Spot WS
+        let binance_spot_config = self.config.feeds.binance_spot.clone();
+        let (bs_tx, _bs_rx) = spsc::spsc_channel::<TradeEvent>(4096);
+        let bs_client = ExchangeWsClient::new(Exchange::BinanceSpot, &binance_spot_config);
+        tokio::spawn(async move {
+            if let Err(e) = bs_client.run(bs_tx).await {
+                tracing::error!(error = %e, "binance spot feed error");
+            }
+        });
+
+        // Binance Futures WS
+        let binance_futures_config = self.config.feeds.binance_futures.clone();
+        let (bf_tx, _bf_rx) = spsc::spsc_channel::<TradeEvent>(4096);
+        let bf_client = ExchangeWsClient::new(Exchange::BinanceFutures, &binance_futures_config);
+        tokio::spawn(async move {
+            if let Err(e) = bf_client.run(bf_tx).await {
+                tracing::error!(error = %e, "binance futures feed error");
+            }
+        });
+
+        // Bybit WS
+        let bybit_config = self.config.feeds.bybit.clone();
+        let (bb_tx, _bb_rx) = spsc::spsc_channel::<TradeEvent>(4096);
+        let bb_client = ExchangeWsClient::new(Exchange::Bybit, &bybit_config);
+        tokio::spawn(async move {
+            if let Err(e) = bb_client.run(bb_tx).await {
+                tracing::error!(error = %e, "bybit feed error");
+            }
+        });
     }
 
-    pub fn events_published(&self) -> u64 {
-        self.events_published
-    }
+    fn spawn_signal_engine(&self, signal_tx: broadcast::Sender<SignalSnapshot>) {
+        tokio::spawn(async move {
+            let engine = SignalEngine::new(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_millis(50));
 
-    pub fn num_cores(&self) -> usize {
-        self.producers.len()
-    }
-}
-
-/// Create ring buffers and shared parameter SeqLock for a multi-core setup.
-pub fn create_infrastructure(
-    num_cores: usize,
-    buffer_capacity: usize,
-) -> (Vec<SpscRingBuffer<TradeEvent>>, Arc<SeqLock<Parameters>>) {
-    let buffers: Vec<_> = (0..num_cores)
-        .map(|_| SpscRingBuffer::new(buffer_capacity))
-        .collect();
-    let params = Arc::new(SeqLock::new(Parameters::default()));
-    (buffers, params)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::Side;
-
-    fn make_event(market_id: u32) -> TradeEvent {
-        TradeEvent {
-            timestamp_ns: 1,
-            price: 0.55,
-            quantity: 10.0,
-            side: Side::Buy,
-            market_id,
-        }
-    }
-
-    #[test]
-    fn new_controller() {
-        let (buffers, params) = create_infrastructure(2, 64);
-        let producers: Vec<_> = buffers.iter().map(|b| b.split().0).collect();
-        let ctrl = Controller::new(producers, params.clone());
-        assert_eq!(ctrl.num_cores(), 2);
-        assert_eq!(ctrl.events_published(), 0);
-        let _ = params;
-    }
-
-    #[test]
-    fn publish_parameters() {
-        let (buffers, params) = create_infrastructure(1, 64);
-        let producers: Vec<_> = buffers.iter().map(|b| b.split().0).collect();
-        let ctrl = Controller::new(producers, params);
-
-        let new_params = Parameters {
-            max_position: 500.0,
-            risk_limit: 0.1,
-            spread_threshold: 0.005,
-            momentum_window: 50,
-        };
-        ctrl.publish_parameters(new_params);
-        let p = ctrl.current_parameters();
-        assert_eq!(p.max_position, 500.0);
-        assert_eq!(p.momentum_window, 50);
-    }
-
-    #[test]
-    fn current_parameters_default() {
-        let (buffers, params) = create_infrastructure(1, 64);
-        let producers: Vec<_> = buffers.iter().map(|b| b.split().0).collect();
-        let ctrl = Controller::new(producers, params);
-        let p = ctrl.current_parameters();
-        assert_eq!(p.max_position, 100.0);
-    }
-
-    #[test]
-    fn send_event_valid() {
-        let rb = SpscRingBuffer::<TradeEvent>::new(64);
-        let (prod, cons) = rb.split();
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl = Controller::new(vec![prod], params);
-
-        assert!(ctrl.send_event(0, make_event(0)).is_ok());
-        assert_eq!(ctrl.events_published(), 1);
-        assert_eq!(cons.try_pop().unwrap().market_id, 0);
-    }
-
-    #[test]
-    fn send_event_invalid_core() {
-        let rb = SpscRingBuffer::<TradeEvent>::new(64);
-        let (prod, _cons) = rb.split();
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl = Controller::new(vec![prod], params);
-
-        assert!(ctrl.send_event(5, make_event(0)).is_err());
-        assert_eq!(ctrl.events_published(), 0);
-    }
-
-    #[test]
-    fn route_event_basic() {
-        let rb = SpscRingBuffer::<TradeEvent>::new(64);
-        let (prod, cons) = rb.split();
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl = Controller::new(vec![prod], params);
-
-        ctrl.route_event(make_event(0)).unwrap();
-        assert!(cons.try_pop().is_some());
-    }
-
-    #[test]
-    fn route_event_round_robin() {
-        let rb0 = SpscRingBuffer::<TradeEvent>::new(64);
-        let rb1 = SpscRingBuffer::<TradeEvent>::new(64);
-        let (prod0, cons0) = rb0.split();
-        let (prod1, cons1) = rb1.split();
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl = Controller::new(vec![prod0, prod1], params);
-
-        // market_id 0 → core 0, market_id 1 → core 1
-        ctrl.route_event(make_event(0)).unwrap();
-        ctrl.route_event(make_event(1)).unwrap();
-        ctrl.route_event(make_event(2)).unwrap(); // → core 0
-        ctrl.route_event(make_event(3)).unwrap(); // → core 1
-
-        assert_eq!(cons0.len(), 2);
-        assert_eq!(cons1.len(), 2);
-    }
-
-    #[test]
-    fn route_event_empty_producers() {
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl = Controller::new(Vec::new(), params);
-        assert!(ctrl.route_event(make_event(0)).is_err());
-    }
-
-    #[test]
-    fn broadcast_event() {
-        let rb0 = SpscRingBuffer::<TradeEvent>::new(64);
-        let rb1 = SpscRingBuffer::<TradeEvent>::new(64);
-        let (prod0, cons0) = rb0.split();
-        let (prod1, cons1) = rb1.split();
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl = Controller::new(vec![prod0, prod1], params);
-
-        let sent = ctrl.broadcast_event(make_event(0));
-        assert_eq!(sent, 2);
-        assert!(cons0.try_pop().is_some());
-        assert!(cons1.try_pop().is_some());
-    }
-
-    #[test]
-    fn collect_signals() {
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl: Controller = Controller::new(Vec::new(), params);
-
-        let mut signals = vec![
-            crate::types::Signal {
-                timestamp_ns: 1,
-                direction: crate::types::Direction::Long,
-                strength: 0.5,
-                market_id: 0,
-            },
-            crate::types::Signal {
-                timestamp_ns: 2,
-                direction: crate::types::Direction::Short,
-                strength: 0.3,
-                market_id: 1,
-            },
-        ];
-        ctrl.collect_signals(&mut signals);
-        assert!(signals.is_empty());
-        assert_eq!(ctrl.drain_collected_signals().len(), 2);
-    }
-
-    #[test]
-    fn drain_collected_signals_empties() {
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl: Controller = Controller::new(Vec::new(), params);
-        let drained = ctrl.drain_collected_signals();
-        assert!(drained.is_empty());
-    }
-
-    #[test]
-    fn events_published_count() {
-        let rb = SpscRingBuffer::<TradeEvent>::new(64);
-        let (prod, _cons) = rb.split();
-        let params = Arc::new(SeqLock::new(Parameters::default()));
-        let mut ctrl = Controller::new(vec![prod], params);
-
-        for i in 0..10 {
-            ctrl.send_event(0, make_event(i)).unwrap();
-        }
-        assert_eq!(ctrl.events_published(), 10);
-    }
-
-    #[test]
-    fn num_cores() {
-        let (buffers, params) = create_infrastructure(4, 32);
-        let producers: Vec<_> = buffers.iter().map(|b| b.split().0).collect();
-        let ctrl = Controller::new(producers, params);
-        assert_eq!(ctrl.num_cores(), 4);
-    }
-
-    #[test]
-    fn create_infrastructure_sizes() {
-        let (buffers, _params) = create_infrastructure(3, 128);
-        assert_eq!(buffers.len(), 3);
-        assert_eq!(buffers[0].capacity(), 128);
-    }
-
-    #[test]
-    fn full_cycle_integration() {
-        let rb = SpscRingBuffer::<TradeEvent>::new(64);
-        let (prod, cons) = rb.split();
-        let params = Arc::new(SeqLock::new(Parameters {
-            max_position: 1000.0,
-            risk_limit: 1.0,
-            spread_threshold: 0.0,
-            momentum_window: 2,
-        }));
-        let mut ctrl = Controller::new(vec![prod], params.clone());
-
-        // Send events through controller
-        for i in 0..5 {
-            let event = TradeEvent {
-                timestamp_ns: i,
-                price: 1.00 + (i as f64) * 0.01,
-                quantity: 10.0,
-                side: Side::Buy,
-                market_id: 0,
-            };
-            ctrl.send_event(0, event).unwrap();
-        }
-
-        // Create engine and process
-        let mut engine = crate::core_engine::CoreEngine::new(0, 0, cons, params);
-        let processed = engine.process_tick();
-        assert_eq!(processed, 5);
-
-        // Drain signals
-        let mut signals = Vec::new();
-        engine.drain_signals(&mut signals);
-        ctrl.collect_signals(&mut signals);
-
-        assert_eq!(ctrl.events_published(), 5);
+            loop {
+                interval.tick().await;
+                let snapshot = engine.snapshot();
+                if signal_tx.send(snapshot).is_err() {
+                    // No receivers yet, keep running
+                }
+            }
+        });
     }
 }

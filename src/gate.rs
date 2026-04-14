@@ -1,82 +1,26 @@
-//! Branchless gate evaluation for risk checks.
-//!
-//! Gates compose multiplicatively: the product of all gate outputs
-//! yields the final risk multiplier (0.0 = blocked, 1.0 = pass).
-//! All operations use arithmetic instead of branches to avoid
-//! branch misprediction penalties on the hot path.
-
-/// Position limit gate: returns 1.0 if |position| < limit, else 0.0.
-#[inline(always)]
-pub fn position_limit_gate(position: f64, limit: f64) -> f64 {
-    let headroom = limit - position.abs();
-    let bits = headroom.to_bits();
-    let sign = (bits >> 63) as f64;
-    1.0 - sign
+/// Branchless gate: multiplies signal by 0.0 or 1.0 based on threshold.
+/// Avoids branch misprediction in the hot path.
+#[derive(Debug, Clone, Copy)]
+pub struct BranchlessGate {
+    pub threshold: f64,
 }
 
-/// Signal strength gate: returns 1.0 if strength >= threshold, else 0.0.
-#[inline(always)]
-pub fn signal_strength_gate(strength: f64, threshold: f64) -> f64 {
-    let diff = strength - threshold;
-    let bits = diff.to_bits();
-    let sign = (bits >> 63) as f64;
-    1.0 - sign
-}
+impl BranchlessGate {
+    pub fn new(threshold: f64) -> Self {
+        Self { threshold }
+    }
 
-/// Spread gate: returns 1.0 if spread <= max_spread, else 0.0.
-#[inline(always)]
-pub fn spread_gate(spread: f64, max_spread: f64) -> f64 {
-    let diff = max_spread - spread;
-    let bits = diff.to_bits();
-    let sign = (bits >> 63) as f64;
-    1.0 - sign
-}
-
-/// Directional agreement gate: returns 1.0 if signal and momentum agree.
-#[inline(always)]
-pub fn direction_gate(signal_dir: f64, momentum_dir: f64) -> f64 {
-    let product = signal_dir * momentum_dir;
-    let bits = product.to_bits();
-    let sign = (bits >> 63) as f64;
-    1.0 - sign
-}
-
-/// Compose position + signal + spread gates multiplicatively.
-#[inline(always)]
-pub fn evaluate_gates(
-    position: f64,
-    position_limit: f64,
-    signal_strength: f64,
-    strength_threshold: f64,
-    spread: f64,
-    max_spread: f64,
-) -> f64 {
-    position_limit_gate(position, position_limit)
-        * signal_strength_gate(signal_strength, strength_threshold)
-        * spread_gate(spread, max_spread)
-}
-
-/// Full gate evaluation with direction. Returns risk multiplier in [0.0, 1.0].
-#[inline(always)]
-#[allow(clippy::too_many_arguments)]
-pub fn full_gate_eval(
-    position: f64,
-    position_limit: f64,
-    signal_strength: f64,
-    strength_threshold: f64,
-    spread: f64,
-    max_spread: f64,
-    signal_dir: f64,
-    momentum_dir: f64,
-) -> f64 {
-    evaluate_gates(
-        position,
-        position_limit,
-        signal_strength,
-        strength_threshold,
-        spread,
-        max_spread,
-    ) * direction_gate(signal_dir, momentum_dir)
+    /// Returns `value * mask` where mask is 1.0 if `|value| >= threshold`, else 0.0.
+    /// Uses sign-bit manipulation to avoid branching.
+    #[inline(always)]
+    pub fn apply(&self, value: f64) -> f64 {
+        let exceeds = value.abs() - self.threshold;
+        // Sign bit is 0 when exceeds >= 0 (pass), 1 when exceeds < 0 (block)
+        let sign_bit = (exceeds.to_bits() >> 63) as f64;
+        // mask = 1.0 when pass, 0.0 when block
+        let mask = 1.0 - sign_bit;
+        value * mask
+    }
 }
 
 #[cfg(test)]
@@ -84,94 +28,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn position_limit_under() {
-        assert_eq!(position_limit_gate(50.0, 100.0), 1.0);
+    fn above_threshold_passes() {
+        let gate = BranchlessGate::new(0.5);
+        assert_eq!(gate.apply(1.0), 1.0);
+        assert_eq!(gate.apply(-1.0), -1.0);
+        assert_eq!(gate.apply(0.5), 0.5); // exactly at threshold
     }
 
     #[test]
-    fn position_limit_at() {
-        assert_eq!(position_limit_gate(100.0, 100.0), 1.0);
+    fn below_threshold_blocks() {
+        let gate = BranchlessGate::new(0.5);
+        assert_eq!(gate.apply(0.3), 0.0);
+        assert_eq!(gate.apply(-0.3), 0.0);
+        assert_eq!(gate.apply(0.0), 0.0);
     }
 
     #[test]
-    fn position_limit_over() {
-        assert_eq!(position_limit_gate(101.0, 100.0), 0.0);
+    fn zero_threshold_passes_all_nonzero() {
+        let gate = BranchlessGate::new(0.0);
+        assert_eq!(gate.apply(0.001), 0.001);
+        assert_eq!(gate.apply(-0.001), -0.001);
+        // Zero itself: abs(0) - 0 = 0, sign bit is 0, so mask=1, result=0*1=0
+        assert_eq!(gate.apply(0.0), 0.0);
     }
 
     #[test]
-    fn position_limit_negative_position() {
-        assert_eq!(position_limit_gate(-50.0, 100.0), 1.0);
+    fn large_values() {
+        let gate = BranchlessGate::new(100.0);
+        assert_eq!(gate.apply(200.0), 200.0);
+        assert_eq!(gate.apply(50.0), 0.0);
+        assert_eq!(gate.apply(-150.0), -150.0);
     }
 
     #[test]
-    fn position_limit_negative_over() {
-        assert_eq!(position_limit_gate(-101.0, 100.0), 0.0);
-    }
-
-    #[test]
-    fn signal_strength_above() {
-        assert_eq!(signal_strength_gate(0.05, 0.01), 1.0);
-    }
-
-    #[test]
-    fn signal_strength_below() {
-        assert_eq!(signal_strength_gate(0.005, 0.01), 0.0);
-    }
-
-    #[test]
-    fn signal_strength_at_threshold() {
-        assert_eq!(signal_strength_gate(0.01, 0.01), 1.0);
-    }
-
-    #[test]
-    fn spread_under_max() {
-        assert_eq!(spread_gate(0.001, 0.005), 1.0);
-    }
-
-    #[test]
-    fn spread_over_max() {
-        assert_eq!(spread_gate(0.01, 0.005), 0.0);
-    }
-
-    #[test]
-    fn spread_at_max() {
-        assert_eq!(spread_gate(0.005, 0.005), 1.0);
-    }
-
-    #[test]
-    fn direction_agree() {
-        assert_eq!(direction_gate(1.0, 1.0), 1.0);
-        assert_eq!(direction_gate(-1.0, -1.0), 1.0);
-    }
-
-    #[test]
-    fn direction_disagree() {
-        assert_eq!(direction_gate(1.0, -1.0), 0.0);
-        assert_eq!(direction_gate(-1.0, 1.0), 0.0);
-    }
-
-    #[test]
-    fn evaluate_gates_all_pass() {
-        let result = evaluate_gates(50.0, 100.0, 0.05, 0.01, 0.001, 0.005);
-        assert_eq!(result, 1.0);
-    }
-
-    #[test]
-    fn evaluate_gates_one_fails() {
-        // position over limit
-        let result = evaluate_gates(150.0, 100.0, 0.05, 0.01, 0.001, 0.005);
-        assert_eq!(result, 0.0);
-    }
-
-    #[test]
-    fn full_gate_eval_all_pass() {
-        let result = full_gate_eval(50.0, 100.0, 0.05, 0.01, 0.001, 0.005, 1.0, 1.0);
-        assert_eq!(result, 1.0);
-    }
-
-    #[test]
-    fn full_gate_eval_direction_blocks() {
-        let result = full_gate_eval(50.0, 100.0, 0.05, 0.01, 0.001, 0.005, 1.0, -1.0);
-        assert_eq!(result, 0.0);
+    fn nan_handling() {
+        let gate = BranchlessGate::new(0.5);
+        // NaN propagates: NaN * anything = NaN
+        let result = gate.apply(f64::NAN);
+        assert!(result.is_nan() || result == 0.0);
     }
 }

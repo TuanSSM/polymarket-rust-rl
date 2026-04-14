@@ -1,0 +1,46 @@
+[execution]
+mode = "dry_run"       # "dry_run" or "live"
+episode_secs = 300     # 5-minute episodes
+max_active_markets = 3
+
+[feeds.chainlink]
+ws_url = "wss://ws.chain.link/v1/streams"
+api_key = "YOUR_CHAINLINK_API_KEY"
+hmac_secret = "YOUR_CHAINLINK_HMAC_SECRET"
+feeds = ["ETH-USD", "BTC-USD"]
+
+[feeds.binance_spot]
+ws_url = "wss://stream.binance.com:9443/ws"
+symbols = ["btcusdt", "ethusdt"]
+
+[feeds.binance_futures]
+ws_url = "wss://fstream.binance.com/ws"
+symbols = ["btcusdt", "ethusdt"]
+
+[feeds.bybit]
+ws_url = "wss://stream.bybit.com/v5/public/spot"
+symbols = ["BTCUSDT", "ETHUSDT"]
+
+[polymarket]
+ws_url = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+rest_url = "https://clob.polymarket.com"
+gamma_url = "https://gamma-api.polymarket.com"
+private_key = ""       # hex-encoded private key (required for live mode)
+api_key = "YOUR_POLY_API_KEY"
+api_secret = "YOUR_POLY_API_SECRET"
+passphrase = "YOUR_POLY_PASSPHRASE"
+
+[strategy]
+prior_prob = 0.5
+cvd_weight = 0.5       # log-likelihood weight for CVD signal
+delay_weight = 0.3     # log-likelihood weight for oracle delay signal
+premium_weight = 0.2   # log-likelihood weight for spot-perp premium
+learning_rate = 0.01   # RL alpha
+discount = 0.99        # RL gamma
+epsilon = 0.1          # epsilon-greedy exploration rate
+
+[risk]
+max_position_usd = 500.0
+max_kelly_fraction = 0.25
+bankroll_usd = 10000.0
+min_edge_bps = 50.0    # minimum edge in basis points to trade
