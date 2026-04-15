@@ -1,39 +1,21 @@
 [package]
-name = "polymarket-rust-rl"
+name = "polymarket-rl"
 version = "0.1.0"
 edition = "2021"
-description = "HFT-inspired per-core execution architecture for Polymarket RL"
 
 [dependencies]
-rust_decimal = { version = "1", features = ["serde-with-str", "macros"] }
-num-traits = "0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "time", "signal"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tungstenite = "0.24"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-
-[[bench]]
-name = "gate_bench"
-harness = false
-
-[[bench]]
-name = "seqlock_bench"
-harness = false
-
-[[bench]]
-name = "spsc_bench"
-harness = false
-
-[[bench]]
-name = "tick_cycle_bench"
-harness = false
-
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3
-
-[profile.bench]
-lto = true
-codegen-units = 1
+toml = "0.8"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+hmac = "0.12"
+sha2 = "0.10"
+rand = { version = "0.8", features = ["small_rng"] }
+url = "2"
+futures-util = "0.3"
